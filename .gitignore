@@ -1,0 +1,4 @@
+.bs-server
+__pycache__
+*.db
+.env
