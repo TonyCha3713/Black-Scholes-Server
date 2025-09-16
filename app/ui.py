@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import plotly.graph_objects as go
 
 from app.core.bsm import price, greeks
 from app.core.heatmap import grid_prices, grid_pnl
@@ -23,6 +24,59 @@ def compute_grid(mode, S, K, T, r, sigma,
         S_vals, sig_vals, Z = grid_pnl(S, K, T, r, sigma, Smin, Smax, nS, sigmin, sigmax, nV, option, purchase_price)
         title = f"{option.capitalize()} P&L (price - purchase)"
     return S_vals, sig_vals, Z, title
+
+def make_grid_heatmap(S_vals, sig_vals, Z, mode, ztitle, show_text=False):
+    """
+    Grid-style heatmap with visible cell boundaries and sensible ticks.
+    - show_text=True overlays numbers in each cell (auto-hides if grid is too big).
+    """
+    colorscale = "Viridis" if mode == "Value" else "RdYlGn"
+    zmid = 0.0 if mode == "P&L" else None
+    zmin = 0.0 if mode == "Value" else None
+
+    # Build the heatmap
+    hm = go.Heatmap(
+        z=Z,
+        x=S_vals,
+        y=sig_vals,
+        colorscale=colorscale,
+        zmid=zmid,
+        zmin=zmin,
+        zsmooth=False,      # no interpolation — crisp cells
+        xgap=1,             # gaps draw visible gridlines between cells
+        ygap=1,
+        colorbar=dict(title=ztitle),
+        hovertemplate="S=%{x:.4g}<br>σ=%{y:.4g}<br>"+ztitle+"=%{z:.4g}<extra></extra>",
+    )
+
+    fig = go.Figure(data=hm)
+
+    # Axes styling
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title="Spot S",
+        yaxis_title="Vol σ",
+        margin=dict(l=50, r=50, t=30, b=40),
+    )
+
+    # Thin the number of ticks so labels don’t overlap
+    def thin(vals, max_ticks=12):
+        step = max(1, len(vals) // max_ticks)
+        return vals[::step]
+
+    fig.update_xaxes(showgrid=True, gridcolor="LightGray",
+                     tickmode="array", tickvals=thin(S_vals),
+                     tickformat="~g")
+    fig.update_yaxes(showgrid=True, gridcolor="LightGray",
+                     tickmode="array", tickvals=thin(sig_vals),
+                     tickformat="~g")
+
+    # Optional per-cell text overlay (only if not too dense)
+    if show_text and (len(S_vals) * len(sig_vals) <= 2000):
+        text = [[f"{Z[j, i]:.2f}" for i in range(len(S_vals))] for j in range(len(sig_vals))]
+        fig.update_traces(text=text, texttemplate="%{text}", textfont=dict(size=10))
+
+    return fig
 
 def main():
     st.title("Black–Scholes Option Pricer + Heatmaps")
@@ -109,24 +163,9 @@ def main():
 
         # Plot
         zlabel = ztitle
-        fig = px.imshow(
-            Z, x=S_vals, y=sig_vals, origin="lower",
-            labels=dict(x="Spot S", y="Vol σ", color=zlabel),
-            color_continuous_scale=("RdYlGn" if mode=="P&L" else "Viridis"),
-            zmin=(0.0 if mode=="Value" else None),
-        )
+        fig = make_grid_heatmap(S_vals, sig_vals, Z, mode, ztitle=zlabel, show_text=False)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Past runs preview
-        st.subheader("Recent runs")
-        with SessionLocal() as db:
-            q = db.query(Calculation).order_by(Calculation.id.desc()).limit(20).all()
-            df = pd.DataFrame([{
-                "id": c.id, "S": c.spot, "K": c.strike, "T": c.time_to_expiry,
-                "sigma": c.volatility, "r": c.risk_free_rate,
-                "p_call": c.purchase_call, "p_put": c.purchase_put, "created_at": c.created_at
-            } for c in q])
-            st.dataframe(df)
     else:
         st.info("Set inputs in the sidebar and click **Calculate**.")
 
