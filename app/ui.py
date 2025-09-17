@@ -1,173 +1,370 @@
+# app/ui.py
+
+import math
 import os
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 
 from app.core.bsm import price, greeks
-from app.core.heatmap import grid_prices, grid_pnl
-from app.db.db import SessionLocal, engine, Base
-from app.db.models import Calculation, HeatmapPoint
+from app.core.heatmap import grid_pnl  # P&L-only grids
 
-Base.metadata.create_all(bind=engine)
-st.set_page_config(page_title="Black–Scholes Pricer", layout="wide")
+# --- Optional persistence (silent; no "recent runs" UI) -----------------------
+PERSIST = os.getenv("PERSIST", "0") in ("1", "true", "True")
 
+SessionLocal = None
+Calculation = None
+HeatmapPoint = None
+Base = None
+engine = None
+
+if PERSIST:
+    try:
+        from app.db.db import SessionLocal as _SessionLocal, Base as _Base, engine as _engine
+        from app.db.models import Calculation as _Calculation, HeatmapPoint as _HeatmapPoint
+
+        SessionLocal = _SessionLocal
+        Calculation = _Calculation
+        HeatmapPoint = _HeatmapPoint
+        Base = _Base
+        engine = _engine
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        PERSIST = False
+
+
+# --- Streamlit page config ----------------------------------------------------
+st.set_page_config(page_title="Black–Scholes Pricer — P&L", layout="wide")
+
+
+# --- Cache: compute P&L grids for both sides ---------------------------------
 @st.cache_data(show_spinner=False)
-def compute_grid(mode, S, K, T, r, sigma,
-                 Smin, Smax, nS, sigmin, sigmax, nV,
-                 option, purchase_price):
-    if mode == "Value":
-        S_vals, sig_vals, Z = grid_prices(S, K, T, r, sigma, Smin, Smax, nS, sigmin, sigmax, nV, option)
-        title = f"{option.capitalize()} value"
-    else:
-        S_vals, sig_vals, Z = grid_pnl(S, K, T, r, sigma, Smin, Smax, nS, sigmin, sigmax, nV, option, purchase_price)
-        title = f"{option.capitalize()} P&L (price - purchase)"
-    return S_vals, sig_vals, Z, title
-
-def make_grid_heatmap(S_vals, sig_vals, Z, mode, ztitle, show_text=False):
+def compute_pnl_grids(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    Smin: float,
+    Smax: float,
+    nS: int,
+    sigmin: float,
+    sigmax: float,
+    nV: int,
+    purchase_call: float,
+    purchase_put: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, str]:
     """
-    Grid-style heatmap with visible cell boundaries and sensible ticks.
-    - show_text=True overlays numbers in each cell (auto-hides if grid is too big).
+    P&L-only: compute call and put P&L grids.
+    Returns: (S_vals, sig_vals, Z_call_pnl, Z_put_pnl, title_call, title_put)
     """
-    colorscale = "Viridis" if mode == "Value" else "RdYlGn"
-    zmid = 0.0 if mode == "P&L" else None
-    zmin = 0.0 if mode == "Value" else None
+    S_vals, sig_vals, Z_call = grid_pnl(
+        S, K, T, r, sigma, Smin, Smax, int(nS), sigmin, sigmax, int(nV),
+        option="call", purchase_price=purchase_call
+    )
+    _, _, Z_put = grid_pnl(
+        S, K, T, r, sigma, Smin, Smax, int(nS), sigmin, sigmax, int(nV),
+        option="put", purchase_price=purchase_put
+    )
+    title_call = "Call P&L (price - purchase_call)"
+    title_put  = "Put P&L (price - purchase_put)"
+    return S_vals, sig_vals, Z_call, Z_put, title_call, title_put
 
-    # Build the heatmap
+
+# --- Plot helpers -------------------------------------------------------------
+def make_grid_heatmap(
+    S_vals: np.ndarray,
+    sig_vals: np.ndarray,
+    Z: np.ndarray,
+    *,
+    ztitle: str,
+    S_base: float,
+    sigma_base: float,
+    K: float,
+    height: int = 720,  
+) -> go.Figure:
+    """
+    Grid-style P&L heatmap:
+      - Diverging RdYlGn (green = profit, red = loss)
+      - Break-even (Z=0) contour line
+      - Base point and ATM marker
+    """
     hm = go.Heatmap(
         z=Z,
         x=S_vals,
         y=sig_vals,
-        colorscale=colorscale,
-        zmid=zmid,
-        zmin=zmin,
-        zsmooth=False,      # no interpolation — crisp cells
-        xgap=1,             # gaps draw visible gridlines between cells
+        colorscale="RdYlGn",
+        zmid=0.0,           # center diverging colormap at 0 P&L
+        zsmooth=False,      # crisp cells
+        xgap=1,
         ygap=1,
         colorbar=dict(title=ztitle),
-        hovertemplate="S=%{x:.4g}<br>σ=%{y:.4g}<br>"+ztitle+"=%{z:.4g}<extra></extra>",
+        hovertemplate="S=%{x:.6g}<br>σ=%{y:.6g}<br>" + ztitle + "=%{z:.6g}<extra></extra>",
     )
 
     fig = go.Figure(data=hm)
-
-    # Axes styling
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Spot S",
         yaxis_title="Vol σ",
         margin=dict(l=50, r=50, t=30, b=40),
+        height=height,
     )
 
-    # Thin the number of ticks so labels don’t overlap
-    def thin(vals, max_ticks=12):
+    def thin(vals: np.ndarray, max_ticks: int = 12) -> np.ndarray:
         step = max(1, len(vals) // max_ticks)
         return vals[::step]
 
-    fig.update_xaxes(showgrid=True, gridcolor="LightGray",
-                     tickmode="array", tickvals=thin(S_vals),
-                     tickformat="~g")
-    fig.update_yaxes(showgrid=True, gridcolor="LightGray",
-                     tickmode="array", tickvals=thin(sig_vals),
-                     tickformat="~g")
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(128,128,128,0.25)",
+                     tickmode="array", tickvals=thin(S_vals), tickformat="~g")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.25)",
+                     tickmode="array", tickvals=thin(sig_vals), tickformat="~g")
 
-    # Optional per-cell text overlay (only if not too dense)
-    if show_text and (len(S_vals) * len(sig_vals) <= 2000):
-        text = [[f"{Z[j, i]:.2f}" for i in range(len(S_vals))] for j in range(len(sig_vals))]
-        fig.update_traces(text=text, texttemplate="%{text}", textfont=dict(size=10))
+    # Base point and ATM line
+    fig.add_trace(go.Scatter(
+        x=[S_base], y=[sigma_base], mode="markers",
+        marker=dict(size=10, symbol="x-thin", line=dict(width=2)),
+        name="Base", hovertemplate="Base<br>S=%{x:.6g}<br>σ=%{y:.6g}<extra></extra>",
+    ))
+    fig.add_vline(x=K, line_dash="dot", line_color="gray",
+                  annotation_text="ATM", annotation_position="top", opacity=0.6)
+
+    # Break-even contour (Z == 0)
+    fig.add_trace(go.Contour(
+        z=Z, x=S_vals, y=sig_vals, showscale=False,
+        contours=dict(start=0.0, end=0.0, size=1.0, coloring="lines"),
+        line=dict(color="black", width=2), name="Break-even", hoverinfo="skip",
+    ))
 
     return fig
 
-def main():
-    st.title("Black–Scholes Option Pricer + Heatmaps")
 
+def slice_plot(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    x_label: str,
+    y_label: str,
+    title: str,
+) -> go.Figure:
+    fig = go.Figure(data=go.Scatter(x=x_vals, y=y_vals, mode="lines", name=y_label))
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        margin=dict(l=50, r=30, t=40, b=40),
+        title=title,
+    )
+    return fig
+
+
+def compact_greeks_table(side_greeks: dict) -> pd.DataFrame:
+    """Return a small, tidy 1-row DataFrame for compact display."""
+    # Order + formatting-friendly names
+    order = [("Delta", "delta"), ("Gamma", "gamma"), ("Vega", "vega"), ("Theta", "theta"), ("Rho", "rho")]
+    data = {label: side_greeks[key] for (label, key) in order if key in side_greeks}
+    return pd.DataFrame([data]).round(6)
+
+
+# --- Main UI ------------------------------------------------------------------
+def main():
+    st.title("Black–Scholes Option Pricer — P&L")
+
+    # ----- Sidebar inputs (rows)
     with st.sidebar:
         st.subheader("Inputs")
-        col1, col2 = st.columns(2)
-        with col1:
-            S = st.number_input("Spot (S)", value=100.0, min_value=0.0)
-            K = st.number_input("Strike (K)", value=100.0, min_value=0.0)
-            r_pct = st.number_input("Risk-free r (%)", value=5.0, step=0.25)
-        with col2:
-            T_years = st.number_input("Time to expiry (years)", value=1.0, min_value=0.0, step=0.05, format="%.4f")
-            sigma_pct = st.number_input("Volatility σ (%)", value=20.0, min_value=0.0, step=0.25)
+        S = st.number_input("Spot (S)", value=100.0, min_value=0.0, step=1.0)
+        K = st.number_input("Strike (K)", value=100.0, min_value=0.0, step=1.0)
+        T_years = st.number_input("Time to expiry (years)", value=1.0, min_value=0.0, step=0.05, format="%.6f")
+        r_pct = st.number_input("Risk-free r (%)", value=5.0, step=0.25, format="%.6f")
+        sigma_pct = st.number_input("Volatility σ (%)", value=20.0, min_value=0.0, step=0.25, format="%.6f")
 
-        option = st.radio("Option side", ["call", "put"], horizontal=True)
-        mode = st.radio("Heatmap mode", ["Value", "P&L"], horizontal=True)
+        st.subheader("Purchase prices (for P&L)")
+        purchase_call = st.number_input("Purchase price (Call)", value=10.0, min_value=0.0, step=0.1)
+        purchase_put  = st.number_input("Purchase price (Put)",  value=10.0, min_value=0.0, step=0.1)
 
-        purchase = 0.0
-        if mode == "P&L":
-            purchase = st.number_input(f"Purchase price for {option}", value=10.0, min_value=0.0)
-
-        st.subheader("Heatmap grid")
-        S_span_pct = st.slider("Spot range around S (±%)", 1, 100, 30)
-        sig_min_pct, sig_max_pct = st.slider("Vol range (%)", 1, 300, (5, 80))
-        nS = st.slider("# Spot steps", 10, 150, 60)
-        nV = st.slider("# Vol steps", 10, 150, 60)
+        st.subheader("Heatmap grid (limited)")
+        # Tighter ranges to keep UI responsive and avoid huge inputs
+        S_span_pct = st.slider("Spot range around S (±%)", 5, 50, 20)
+        sig_min_pct, sig_max_pct = st.slider("Vol range (%)", 5, 150, (10, 60))
+        nS = st.slider("# Spot steps", 20, 80, 40)
+        nV = st.slider("# Vol steps", 20, 80, 40)
 
         calc_btn = st.button("Calculate", type="primary")
 
-    if calc_btn:
-        r = r_pct/100.0; sigma = sigma_pct/100.0; T = T_years
+    # Tabs: Call and Put
+    tab_call, tab_put = st.tabs(["Call", "Put"])
 
-        # Prices & Greeks
-        call_val = price(S,K,T,r,sigma,"call")
-        put_val  = price(S,K,T,r,sigma,"put")
-        G = greeks(S,K,T,r,sigma)
+    if not calc_btn:
+        st.info("Set inputs in the sidebar and click **Calculate**.")
+        return
 
-        # Show summary
-        left, right = st.columns([1,1])
+    # ----- Normalize / validate
+    r = r_pct / 100.0
+    sigma = sigma_pct / 100.0
+    T = T_years
+
+    # Build ranges
+    Smin = max(0.0, S * (1 - S_span_pct / 100.0))
+    Smax = S * (1 + S_span_pct / 100.0)
+    sigmin = min(sigma, sig_min_pct / 100.0)
+    sigmax = max(sigma, sig_max_pct / 100.0)
+    if sigmin == sigmax:
+        sigmax = sigmin + 0.0001
+
+    # ----- Scalar prices, base P&L, and Greeks
+    call_price = float(price(S, K, T, r, sigma, "call"))
+    put_price  = float(price(S, K, T, r, sigma, "put"))
+    call_pnl_base = call_price - purchase_call
+    put_pnl_base  = put_price  - purchase_put
+    G = greeks(S, K, T, r, sigma)  # dict with 'call' and 'put'
+
+    call_greeks_df = compact_greeks_table(G["call"])
+    put_greeks_df  = compact_greeks_table(G["put"])
+
+    # ----- Grids (P&L for both sides)
+    S_vals, sig_vals, Z_call, Z_put, title_call, title_put = compute_pnl_grids(
+        S, K, T, r, sigma, Smin, Smax, nS, sigmin, sigmax, nV, purchase_call, purchase_put
+    )
+
+    # ----- Optional persistence (no UI surface) — store P&L only
+    if PERSIST and SessionLocal is not None:
+        try:
+            with SessionLocal() as db:
+                calc = Calculation(
+                    spot=float(S), strike=float(K), time_to_expiry=float(T),
+                    volatility=float(sigma), risk_free_rate=float(r),
+                    purchase_call=float(purchase_call), purchase_put=float(purchase_put),
+                )
+                db.add(calc)
+                db.flush()
+
+                target_points = 2000  # cap rows written
+                stride = max(1, int(math.sqrt((len(S_vals) * len(sig_vals)) / max(1, target_points))))
+
+                rows = []
+                for j in range(0, len(sig_vals), stride):
+                    vv = float(sig_vals[j])
+                    for i in range(0, len(S_vals), stride):
+                        ss = float(S_vals[i])
+                        rows.append(
+                            HeatmapPoint(
+                                calculation_id=calc.id, spot_shock=ss, vol=vv,
+                                call_pnl=float(Z_call[j, i]), put_pnl=float(Z_put[j, i]),
+                            )
+                        )
+                if rows:
+                    db.bulk_save_objects(rows)
+                db.commit()
+        except Exception:
+            pass  # silent if DB unavailable
+
+    # ----- CALL TAB -----
+    with tab_call:
+        st.subheader("Overview (Call)")
+        left, right = st.columns([2, 1])
         with left:
-            st.metric("Call price", f"{call_val:,.4f}")
-            st.metric("Put price",  f"{put_val:,.4f}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Call price", f"{call_price:,.4f}")
+            m2.metric("Purchase price (Call)", f"{purchase_call:,.4f}")
+            m3.metric("Base P&L (Call)", f"{call_pnl_base:,.4f}")
         with right:
-            st.write("**Greeks (at inputs)**")
-            st.dataframe(pd.DataFrame(G).round(6))
+            st.caption("Greeks at input (Θ per year; Vega per 1.0 vol)")
+            st.table(call_greeks_df)  # compact, non-interactive
 
-        # Heatmap ranges
-        Smin = S * (1 - S_span_pct/100.0)
-        Smax = S * (1 + S_span_pct/100.0)
-        sigmin = sig_min_pct/100.0
-        sigmax = sig_max_pct/100.0
+        st.subheader("Heatmap (Call P&L)")
+        fig_call = make_grid_heatmap(
+            S_vals, sig_vals, Z_call, ztitle=title_call, S_base=S, sigma_base=sigma, K=K, height=720
+        )
+        st.plotly_chart(fig_call, use_container_width=True)
 
-        S_vals, sig_vals, Z, ztitle = compute_grid(
-            mode, S,K,T,r,sigma, Smin,Smax,nS, sigmin,sigmax,nV, option, purchase
+        st.subheader("Slices (Call P&L)")
+        # No sliders: use base sigma and base S
+        j_call = int(np.argmin(np.abs(sig_vals - sigma)))
+        i_call = int(np.argmin(np.abs(S_vals - S)))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(
+                slice_plot(
+                    x_vals=S_vals, y_vals=Z_call[j_call, :],
+                    x_label="Spot S", y_label="P&L",
+                    title=f"vs S (σ={sig_vals[j_call]:.4f})",
+                ),
+                use_container_width=True,
+            )
+        with c2:
+            st.plotly_chart(
+                slice_plot(
+                    x_vals=sig_vals, y_vals=Z_call[:, i_call],
+                    x_label="Vol σ", y_label="P&L",
+                    title=f"vs σ (S={S_vals[i_call]:.4f})",
+                ),
+                use_container_width=True,
+            )
+
+        # CSV download for Call P&L
+        df_call = pd.DataFrame(Z_call, index=pd.Index(sig_vals, name="sigma"), columns=pd.Index(S_vals, name="S"))
+        st.download_button(
+            label="Download Call P&L grid (CSV)",
+            data=df_call.to_csv().encode("utf-8"),
+            file_name=f"grid_call_pnl_{int(S)}_{int(K)}.csv",
+            mime="text/csv",
         )
 
-        # Save to DB
-        with SessionLocal() as db:
-            calc = Calculation(
-                spot=S, strike=K, time_to_expiry=T, volatility=sigma, risk_free_rate=r,
-                purchase_call=(purchase if (mode=="P&L" and option=="call") else None),
-                purchase_put=(purchase if (mode=="P&L" and option=="put") else None),
+    # ----- PUT TAB -----
+    with tab_put:
+        st.subheader("Overview (Put)")
+        left, right = st.columns([2, 1])
+        with left:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Put price", f"{put_price:,.4f}")
+            m2.metric("Purchase price (Put)", f"{purchase_put:,.4f}")
+            m3.metric("Base P&L (Put)", f"{put_pnl_base:,.4f}")
+        with right:
+            st.caption("Greeks at input (Θ per year; Vega per 1.0 vol)")
+            st.table(put_greeks_df)
+
+        st.subheader("Heatmap (Put P&L)")
+        fig_put = make_grid_heatmap(
+            S_vals, sig_vals, Z_put, ztitle=title_put, S_base=S, sigma_base=sigma, K=K, height=720
+        )
+        st.plotly_chart(fig_put, use_container_width=True)
+
+        st.subheader("Slices (Put P&L)")
+        # No sliders: use base sigma and base S
+        j_put = int(np.argmin(np.abs(sig_vals - sigma)))
+        i_put = int(np.argmin(np.abs(S_vals - S)))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(
+                slice_plot(
+                    x_vals=S_vals, y_vals=Z_put[j_put, :],
+                    x_label="Spot S", y_label="P&L",
+                    title=f"vs S (σ={sig_vals[j_put]:.4f})",
+                ),
+                use_container_width=True,
             )
-            db.add(calc); db.flush()
-            # bulk insert (downsample if you like)
-            rows = []
-            for j, vv in enumerate(sig_vals):
-                for i, ss in enumerate(S_vals):
-                    if mode == "Value":
-                        rows.append(HeatmapPoint(
-                            calculation_id=calc.id, spot_shock=float(ss), vol=float(vv),
-                            call_value=float(Z[j,i]) if option=="call" else None,
-                            put_value=float(Z[j,i])  if option=="put"  else None
-                        ))
-                    else:
-                        rows.append(HeatmapPoint(
-                            calculation_id=calc.id, spot_shock=float(ss), vol=float(vv),
-                            call_pnl=float(Z[j,i]) if option=="call" else None,
-                            put_pnl=float(Z[j,i])  if option=="put"  else None
-                        ))
-            db.bulk_save_objects(rows)
-            db.commit()
+        with c2:
+            st.plotly_chart(
+                slice_plot(
+                    x_vals=sig_vals, y_vals=Z_put[:, i_put],
+                    x_label="Vol σ", y_label="P&L",
+                    title=f"vs σ (S={S_vals[i_put]:.4f})",
+                ),
+                use_container_width=True,
+            )
 
-        # Plot
-        zlabel = ztitle
-        fig = make_grid_heatmap(S_vals, sig_vals, Z, mode, ztitle=zlabel, show_text=False)
-        st.plotly_chart(fig, use_container_width=True)
+        # CSV download for Put P&L
+        df_put = pd.DataFrame(Z_put, index=pd.Index(sig_vals, name="sigma"), columns=pd.Index(S_vals, name="S"))
+        st.download_button(
+            label="Download Put P&L grid (CSV)",
+            data=df_put.to_csv().encode("utf-8"),
+            file_name=f"grid_put_pnl_{int(S)}_{int(K)}.csv",
+            mime="text/csv",
+        )
 
-    else:
-        st.info("Set inputs in the sidebar and click **Calculate**.")
 
 if __name__ == "__main__":
     main()
